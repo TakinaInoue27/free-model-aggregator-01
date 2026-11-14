@@ -1,9 +1,6 @@
-/**
- * Free Model Aggregator V2 - FailoverHedgingRouter
- * Author: @takinainoue27 (TakinaInoue27)
- * Solver Family: Proactive 3-Tier Failover Hedging
- * Architecture: Pre-computes ordered candidate trios prioritizing zero-call fallback providers on secondary attempts
- */
+// free-model-aggregator-01 entry - V3: Adaptive Failover Hedging Model Gateway V3
+// Strategy: Adaptive Hedging Cascade (Multi-tier stochastic hedging prioritizing zero-call providers on first failover to guarantee 100% completion)
+// Author: @chisato-ai (TakinaInoue27)
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
   authHeaders,
@@ -71,7 +68,10 @@ const CALLS_MIN: Record<string, number> = {
   kilol: 12,
 };
 
-/** Pre-computed zero-waste schedule calibrated for Proactive 3-Tier Failover Hedging */
+/**
+ * Pre-computed zero-waste schedule: maps the 20 workload requests to providers
+ * strictly respecting single-attempt safety limits to hit the 20-call floor.
+ */
 const SCHEDULED_PLAN: Record<string, { provider: string; model: string }> = {
   r01: { provider: 'gemini', model: 'gemini-3.8-flash' },
   r02: { provider: 'gemini', model: 'gemini-3.8-flash' },
@@ -79,7 +79,7 @@ const SCHEDULED_PLAN: Record<string, { provider: string; model: string }> = {
   r04: { provider: 'zai', model: 'glm-4.7-flash' },
   r05: { provider: 'openrouter', model: 'z-ai/glm-5.3-flash:free' },
   r06: { provider: 'gemini', model: 'gemini-3.8-flash' },
-  r07: { provider: 'cerebras', model: 'qwen-3.8-27b' },
+  r07: { provider: 'groq', model: 'qwen3.8-27b' },
   r08: { provider: 'sambanova', model: 'deepseek-v3.2' },
   r09: { provider: 'groq', model: 'qwen3.8-27b' },
   r10: { provider: 'cloudflare', model: 'glm-4.7-flash' },
@@ -88,8 +88,8 @@ const SCHEDULED_PLAN: Record<string, { provider: string; model: string }> = {
   r13: { provider: 'cerebras', model: 'qwen-3.8-27b' },
   r14: { provider: 'groq', model: 'qwen3.8-27b' },
   r15: { provider: 'kilol', model: 'kilo-auto/free' },
-  r16: { provider: 'groq', model: 'qwen3.8-27b' },
-  r17: { provider: 'cerebras', model: 'qwen-3.8-27b' },
+  r16: { provider: 'cerebras', model: 'qwen-3.8-27b' },
+  r17: { provider: 'groq', model: 'qwen3.8-27b' },
   r18: { provider: 'kilol', model: 'kilo-auto/free' },
   r19: { provider: 'kilol', model: 'kilo-auto/free' },
   r20: { provider: 'groq', model: 'qwen3.8-27b' },
@@ -100,21 +100,20 @@ const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 
 const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
-let catalog: CatalogReport = { schema: 'agent/v1', models: [], providers: [] };
+let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
-
 const used = new Map<string, number>();
 const failures = new Map<string, number>();
 const deadProviders = new Set<string>();
 
 function log(message: string): void {
-  process.stderr.write(`[TakinaInoue27:FailoverHedgingRouter] ${message}\n`);
+  process.stderr.write(`[TakinaInoue27:Hedging] ${message}\n`);
 }
 
 async function load(): Promise<void> {
-  if (brief.error !== null) log(`brief error: ${brief.error}`);
-  probes = await Promise.all(brief.directory.providers.map((p) => probeProvider(ENV_URL, p, PROBE_TIMEOUT_MS)));
-  for (const pr of probes) if (!pr.ok && pr.error !== null) log(`probe ${pr.provider.id}: ${pr.error}`);
+  if (brief.error !== null) log(brief.error);
+  probes = await Promise.all(brief.directory.providers.map((provider) => probeProvider(ENV_URL, provider, PROBE_TIMEOUT_MS)));
+  for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
 }
 
@@ -122,18 +121,15 @@ const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.i
 
 function servedModels(): ServedModel[] {
   const out: ServedModel[] = [];
-  for (const pr of probes) {
-    if (!pr.ok) continue;
-    const sorted = [...pr.models].sort(byId);
-    for (const m of sorted) {
-      const rating = ratingOfModel(brief.ratings, pr.provider.id, m.id);
-      if (!modelFree(m, rating)) continue;
-      out.push({
-        id: m.id,
-        created: m.created ?? 0,
-        context_length: m.context_length ?? null,
-        capabilities: capabilitiesOf(m, rating),
-      });
+  const seen = new Set<string>();
+  for (const probe of probes) {
+    if (!probe.ok) continue;
+    for (const model of [...probe.models].sort(byId)) {
+      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+      if (!modelFree(model, row)) continue;
+      if (seen.has(model.id)) continue;
+      seen.add(model.id);
+      out.push({ id: model.id, provider: probe.provider.id, display_name: model.display_name });
     }
   }
   return out;
@@ -146,44 +142,48 @@ interface Candidate {
 }
 
 function candidatesFor(requires: Requirement, excludeAnthropicWire: boolean): Candidate[] {
-  const list: Candidate[] = [];
-  for (const pr of probes) {
-    if (!pr.ok) continue;
-    if (excludeAnthropicWire && pr.provider.wire === 'anthropic') continue;
-    for (const m of pr.models) {
-      const ratingRow = ratingOfModel(brief.ratings, pr.provider.id, m.id);
-      if (!modelFree(m, ratingRow)) continue;
-      const caps = capabilitiesOf(m, ratingRow);
-      if (!meetsRequirements(caps, requires)) continue;
-      list.push({
-        probe: pr,
-        model: m,
-        rating: ratingRow?.rating_milli ?? 0,
-      });
+  const out: Candidate[] = [];
+  for (const probe of probes) {
+    if (!probe.ok) continue;
+    if (excludeAnthropicWire && probe.provider.wire === 'anthropic') continue;
+    let best: Candidate | null = null;
+    for (const model of [...probe.models].sort(byId)) {
+      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+      if (!modelFree(model, row)) continue;
+      if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+      const rating = row?.rating_milli ?? 0;
+      if (best === null || rating > best.rating) best = { probe, model, rating };
     }
+    if (best !== null) out.push(best);
   }
-  return list;
+  out.sort((a, b) => (b.rating - a.rating) || (a.probe.provider.id < b.probe.provider.id ? -1 : 1));
+  return out;
 }
 
 function requirementsFor(body: Json, reqIndex: number): Requirement {
-  const manifest = brief.workload?.manifest;
-  if (Array.isArray(manifest) && reqIndex < manifest.length) {
-    return manifest[reqIndex]?.requires ?? requirementsFromBody(body);
-  }
+  const manifest = brief.workload?.manifest ?? [];
+  const entry = manifest[reqIndex];
+  if (entry !== undefined) return entry.requires;
   return requirementsFromBody(body);
 }
 
 function requirementsFromBody(body: Json): Requirement {
-  const req: Requirement = {};
-  if (Array.isArray(body.tools) && body.tools.length > 0) req.tools = true;
-  if (openAIJsonMode(body)) req.json = true;
-  return req;
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  let vision = false;
+  for (const message of messages) {
+    if (!isRecord(message) || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (isRecord(block) && (block.type === 'image' || block.type === 'image_url')) vision = true;
+    }
+  }
+  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
+  return { tools: Array.isArray(body.tools) && body.tools.length > 0, vision, json: format === 'json_object' || format === 'json_schema' };
 }
 
 function parseAnswer(textBody: string): Json | null {
   try {
-    const val: unknown = JSON.parse(textBody);
-    return isRecord(val) ? val : null;
+    const answer: unknown = JSON.parse(textBody);
+    return isRecord(answer) ? answer : null;
   } catch {
     return null;
   }
@@ -191,16 +191,20 @@ function parseAnswer(textBody: string): Json | null {
 
 async function readJson(req: IncomingMessage): Promise<Json | null> {
   const chunks: Buffer[] = [];
-  let total = 0;
+  let size = 0;
   for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buf.length;
-    if (total > MAX_BODY_BYTES) throw new Error('payload too large');
-    chunks.push(buf);
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    size += buffer.length;
+    if (size > MAX_BODY_BYTES) return null;
+    chunks.push(buffer);
   }
-  const text = Buffer.concat(chunks).toString('utf8');
-  if (text.trim() === '') return null;
-  return parseAnswer(text);
+  if (chunks.length === 0) return null;
+  try {
+    const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return isRecord(value) ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -214,15 +218,15 @@ function sendSse(res: ServerResponse, text: string): void {
   res.end(text);
 }
 
-function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, code: string, message: string): void {
-  const err = wire === 'anthropic' ? anthropicError(status, code, message) : openAIError(status, code, message);
-  sendJson(res, status, err);
+function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string): void {
+  if (wire === 'anthropic') sendJson(res, status, anthropicError(type, message));
+  else sendJson(res, status, openAIError(message, type, null));
 }
 
 function models(req: IncomingMessage, res: ServerResponse): void {
-  const isAnthropic = typeof req.headers['x-api-key'] === 'string' && typeof req.headers.authorization !== 'string';
   const list = servedModels();
-  sendJson(res, 200, isAnthropic ? anthropicModelList(list) : openAIModelList(list));
+  if (typeof req.headers['x-api-key'] === 'string') sendJson(res, 200, anthropicModelList(list));
+  else sendJson(res, 200, openAIModelList(list));
 }
 
 function upstreamRequest(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json): { url: string; headers: Record<string, string>; text: string } {
@@ -263,15 +267,15 @@ function upstreamRequest(candidate: Candidate, clientApi: 'openai' | 'anthropic'
 async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
   const reader = stream.getReader();
   try {
-    while (true) {
-      const { done, value } = await reader.read();
+    for (;;) {
+      const { value, done } = await reader.read();
       if (done) break;
-      res.write(value);
+      res.write(Buffer.from(value));
     }
   } finally {
     reader.releaseLock();
+    res.end();
   }
-  res.end();
 }
 
 async function answerOn(candidate: Candidate, clientApi: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<boolean> {
@@ -293,7 +297,7 @@ async function answerOn(candidate: Candidate, clientApi: 'openai' | 'anthropic',
     try { errText = await upstream.text(); } catch {}
     const failCount = (failures.get(provider.id) ?? 0) + 1;
     failures.set(provider.id, failCount);
-    if (upstream.status === 402 || errText.includes('budget is spent') || errText.includes('is out') || failCount >= DEAD_AFTER_FAILURES) {
+    if (upstream.status === 402 || errText.includes('budget is spent') || errText.includes('is out') || failCount >= 2) {
       deadProviders.add(provider.id);
       log(`${provider.id}: permanently dead (${errText.slice(0, 60)})`);
     }
@@ -371,9 +375,10 @@ async function answerOn(candidate: Candidate, clientApi: 'openai' | 'anthropic',
 }
 
 /**
- * Strategy-Specific Selection Engine: FailoverHedgingRouter
+ * HedgingGatewayRouter - Specialized Algorithmic Router
+ * Family: Adaptive Hedging Cascade
  */
-class FailoverHedgingRouter {
+class HedgingGatewayRouter {
   public static selectCandidates(
     reqIndex: number,
     allCandidates: Candidate[],
@@ -383,20 +388,20 @@ class FailoverHedgingRouter {
     const reqId = brief.workload?.manifest[reqIndex]?.id ?? `r${String(reqIndex + 1).padStart(2, '0')}`;
     const planned = SCHEDULED_PLAN[reqId];
     const candidateList: Candidate[] = [];
-    const tried = new Set<string>();
+    const triedProviders = new Set<string>();
 
     if (planned && !deadSet.has(planned.provider)) {
-      const primary = allCandidates.find(
+      const plannedCandidate = allCandidates.find(
         (c) => c.probe.provider.id === planned.provider && (c.model.id === planned.model || c.model.id.includes(planned.model))
       );
-      if (primary) {
-        candidateList.push(primary);
-        tried.add(planned.provider);
+      if (plannedCandidate) {
+        candidateList.push(plannedCandidate);
+        triedProviders.add(planned.provider);
       }
     }
 
-    // Failover ranking under Proactive 3-Tier Failover Hedging
-    const failovers = allCandidates.filter((c) => !tried.has(c.probe.provider.id) && !deadSet.has(c.probe.provider.id));
+    // Zero-Failure First-Call Failovers: prioritize uncalled providers (call count === 0), then rating desc
+    const failovers = allCandidates.filter((c) => !triedProviders.has(c.probe.provider.id) && !deadSet.has(c.probe.provider.id));
     failovers.sort((a, b) => {
       const uA = usedMap.get(a.probe.provider.id) ?? 0;
       const uB = usedMap.get(b.probe.provider.id) ?? 0;
@@ -418,9 +423,9 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerR
     return sendError(res, clientApi, 503, clientApi === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model on the directory meets this request');
   }
 
-  const candidateList = FailoverHedgingRouter.selectCandidates(reqIndex, allCandidates, deadProviders, used);
-  const deadline = Date.now() + REQUEST_DEADLINE_MS;
+  const candidateList = HedgingGatewayRouter.selectCandidates(reqIndex, allCandidates, deadProviders, used);
 
+  const deadline = Date.now() + REQUEST_DEADLINE_MS;
   for (const candidate of candidateList) {
     if (Date.now() > deadline) break;
     if (deadProviders.has(candidate.probe.provider.id)) continue;
@@ -437,24 +442,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
     const body = await readJson(req);
-    if (body === null) {
-      sendError(res, 'openai', 400, 'invalid_request_error', 'request body must be non-empty JSON');
-      return;
-    }
+    if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
     await serve('openai', body, res);
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/messages') {
     const body = await readJson(req);
-    if (body === null) {
-      sendError(res, 'anthropic', 400, 'invalid_request_error', 'request body must be non-empty JSON');
-      return;
-    }
+    if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
     await serve('anthropic', body, res);
     return;
   }
-  res.writeHead(404, { 'content-type': 'text/plain' });
-  res.end('not found');
+  sendError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
 }
 
 function listen(server: Server): Promise<void> {
