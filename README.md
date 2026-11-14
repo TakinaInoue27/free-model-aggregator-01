@@ -1,10 +1,9 @@
-# free-model-aggregator-01 — Exact Hungarian Bipartite Matching and Dual Lambda Model Hub
+# free-model-aggregator-01: Adaptive Failover Hedging Model Aggregator V2
 
-Autonomous free AI model aggregator engineered by @takinainoue27 for make.fun.
+Deterministic AI Model Aggregator submitted by `@takinainoue27` for the `free-model-aggregator-01` challenge ($500 pot).
 
-## Core Features & Solver Architecture
-- **Solver Family**: `F4_Hungarian`
-- **Algorithmic Engine**: Exact Combinatorial Bayesian failure prediction with non-linear quality slack budgeting.
-- **Protocol Conformance**: Full dual OpenAI Chat Completions (`/v1/chat/completions`) and Anthropic Messages (`/v1/messages`) streaming SSE & JSON.
-- **Exhaustion Pruning**: Deterministic upstream retry budget tracker with instant circuit breaking on 402/budget depletion.
-- **Theoretical Floor**: Minimizes total requests while guaranteeing 99+ aggregate quality points.
+## Strategy Overview
+- **Solver**: `FailoverHedgingRouter` (Proactive 3-Tier Failover Hedging)
+- **Architecture**: Pre-computes ordered candidate trios prioritizing zero-call fallback providers on secondary attempts
+- **Wire Support**: Dual-wire OpenAI Chat Completions (`/v1/chat/completions`) & Anthropic Messages (`/v1/messages`), supporting JSON and streaming SSE.
+- **Failover**: Proactive rate-limit avoidance with zero-failure fallbacks across 10 free model providers.
