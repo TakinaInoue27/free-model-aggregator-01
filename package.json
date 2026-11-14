@@ -1,0 +1,13 @@
+{
+  "name": "free-model-aggregator-01-takinainoue27",
+  "version": "0.1.0",
+  "description": "Exact Hungarian Bipartite Matching and Dual Lambda Model Hub",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}
